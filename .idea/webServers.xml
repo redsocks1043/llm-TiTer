@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="396efd7f-200e-496e-9f5d-bd82077351ac" name="432实验室">
+        <fileTransfer accessType="SFTP" host="222.197.102.115" port="22" sshConfigId="4d73bd25-5918-401d-bc0b-eded9159da99" sshConfig="ubuntu@222.197.102.115:22 key" keyPair="true">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>
