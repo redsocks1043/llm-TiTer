@@ -3,7 +3,9 @@ import json
 import requests
 from collections import defaultdict
 from typing import List
-
+import pickle
+from tqdm import tqdm
+import re  # <-- THIS IS THE FIX
 
 class MultiAgentCoHPredictor:
     """
@@ -19,13 +21,6 @@ class MultiAgentCoHPredictor:
                  device: str = "cuda:0"):
         """
         初始化预测器。
-
-        参数:
-            dataset_path (str): 数据集目录的路径。
-            execution_model (str): 用于执行最终预测的Ollama模型名称。
-            ollama_base_url (str): Ollama API的基础URL。
-            temperature (float): LLM生成时使用的温度参数。
-            device (str): 计算设备（当前版本主要在CPU上运行，但保留此参数以备将来使用）。
         """
         if not dataset_path:
             raise ValueError("必须提供数据集路径 (dataset_path)。")
@@ -36,6 +31,7 @@ class MultiAgentCoHPredictor:
         self.ollama_api_url = f"{ollama_base_url}/api/generate"
         self.temperature = temperature
         self.device = device
+        self.reward_cache_path = os.path.join(dataset_path, 'rewards.pkl')
 
         # 加载数据映射
         self.entity_map = self._load_map(os.path.join(dataset_path, 'entity2id.txt'))
@@ -66,7 +62,8 @@ class MultiAgentCoHPredictor:
             "options": {"temperature": self.temperature}
         }
         try:
-            response = requests.post(self.ollama_api_url, json=payload)
+            # I've also re-added the timeout for robustness
+            response = requests.post(self.ollama_api_url, json=payload, timeout=180)
             response.raise_for_status()
             return response.json().get('response', '')
         except requests.RequestException as e:
@@ -77,31 +74,16 @@ class MultiAgentCoHPredictor:
                                                 rl_candidate_entities: List[str], top_k: int = 10) -> List[tuple]:
         """
         使用LLM根据RL提供的候选实体列表进行最终预测。
-
-        参数:
-            head_id (int): 头实体ID。
-            relation_id (int): 关系ID。
-            timestamp (int): 时间戳ID。
-            rl_candidate_entities (List[str]): 由RL模型生成的候选实体名称列表。
-            top_k (int): 希望LLM返回的排序后的实体数量。
-
-        返回:
-            List[tuple]: 一个元组列表，格式为 [('预测方法', '实体名称'), ...]。
         """
         head_text = self.id_to_entity.get(head_id, f"实体_{head_id}")
         relation_text = self.id_to_relation.get(relation_id, f"关系_{relation_id}")
         date_text = self.id_to_ts.get(timestamp, f"时间_{timestamp}")
 
-        # 格式化RL候选实体列表，用于Prompt
         available_entities_for_prompt = "\n".join([f"- {name}" for name in rl_candidate_entities])
-
-        # 构建历史上下文
         history_facts = self._get_recent_history(head_id, timestamp)
         history_text = self._convert_facts_to_text(history_facts)
-
         objective = f"在{date_text}，当发生事件“{head_text} {relation_text} ?”时，最有可能的尾实体是什么？"
 
-        # 构建一个优化的、单次的预测Prompt
         final_prediction_prompt = f"""You are an expert in temporal knowledge graph reasoning. Your task is to predict the most likely tail entity based on the provided context and a list of high-quality candidates.
 
 ### Objective:
@@ -121,11 +103,7 @@ class MultiAgentCoHPredictor:
 
 ### Final Prediction:
 """
-
-        # 使用执行模型进行单次调用
         final_result = self._call_ollama_model(self.execution_model, final_prediction_prompt)
-
-        # 解析最终预测结果
         return self._parse_final_predictions(final_result, top_k, rl_candidate_entities)
 
     def _parse_final_predictions(self, response_text: str, top_k: int, available_entities: List[str]) -> List[tuple]:
@@ -133,34 +111,88 @@ class MultiAgentCoHPredictor:
         解析LLM的输出，提取排序后的实体列表。
         """
         predictions = []
-        # 清理和分割LLM的响应
         lines = [line.strip() for line in response_text.strip().split('\n')]
 
         for line in lines:
             if not line: continue
-
-            # 移除可能的编号和多余字符
             entity_text = line.split('.', 1)[-1].strip().replace('*', '').replace('-', '').strip()
-
-            # 简单的模糊匹配，以防LLM返回的实体名称与候选列表有微小差异
             matched_entity = next((cand for cand in available_entities if cand.lower() == entity_text.lower()), None)
-
             if matched_entity:
-                if matched_entity not in [p[1] for p in predictions]:  # 避免重复添加
+                if matched_entity not in [p[1] for p in predictions]:
                     predictions.append(("llm_prediction", matched_entity))
-
             if len(predictions) >= top_k:
                 break
 
-        # 如果LLM的预测结果无法解析或数量不足，用RL的候选实体进行补充
         if len(predictions) < top_k:
             for cand in available_entities:
                 if cand not in [p[1] for p in predictions]:
                     predictions.append(("rl_candidate_fallback", cand))
                 if len(predictions) >= top_k:
                     break
-
         return predictions
+
+    def generate_and_cache_rewards(self, dataloader):
+        """
+        【优化版】使用LLM从训练数据生成奖励并缓存到文件。
+        该版本采用批处理方式，将一个批次的数据合并为单个Prompt进行请求。
+        """
+        rewards = {}
+        processed_count = 0
+
+        for batch in tqdm(dataloader, desc="Generating LLM Rewards (Batch Mode)"):
+            src_batch, rel_batch, dst_batch, time_batch = batch
+            batch_prompt_parts = []
+
+            for i in range(len(src_batch)):
+                head_id = src_batch[i].item()
+                relation_id = rel_batch[i].item()
+                timestamp = time_batch[i].item()
+
+                head_text = self.id_to_entity.get(head_id, f"实体_{head_id}")
+                relation_text = self.id_to_relation.get(relation_id, f"关系_{relation_id}")
+                date_text = self.id_to_ts.get(timestamp, f"时间_{timestamp}")
+
+                history_facts = self._get_recent_history(head_id, timestamp)
+                history_text = self._convert_facts_to_text(history_facts)
+                objective = f"在{date_text}，当发生事件“{head_text} {relation_text} ?”时，最有可能的尾实体是什么？"
+
+                prompt_part = f"""--- Sample {i} ---
+### Objective:
+{objective}
+
+### Historical Context:
+{history_text}
+"""
+                batch_prompt_parts.append(prompt_part)
+
+            final_batch_prompt = "You will be given multiple samples, each with an objective and historical context. For each sample, predict the single most likely tail entity.\nYour response must follow this format exactly, with one line for each sample:\nAnswer for Sample 0: [Entity Name]\nAnswer for Sample 1: [Entity Name]\n...\n\n" + "\n".join(
+                batch_prompt_parts)
+
+            llm_batch_response = self._call_ollama_model(self.execution_model, final_batch_prompt)
+
+            if not llm_batch_response:
+                print(f"  - Skipped batch due to LLM call failure.")
+                continue
+
+            predictions = re.findall(r"Answer for Sample (\d+):\s*(.*)", llm_batch_response)
+            parsed_predictions = {int(index): answer.strip() for index, answer in predictions}
+
+            for i in range(len(src_batch)):
+                llm_prediction = parsed_predictions.get(i)
+                if llm_prediction is None:
+                    continue
+
+                true_tail_id = dst_batch[i].item()
+                true_tail_text = self.id_to_entity.get(true_tail_id, f"实体_{true_tail_id}")
+                reward = 1.0 if true_tail_text.lower() in llm_prediction.lower() else -1.0
+                cache_key = (src_batch[i].item(), rel_batch[i].item(), time_batch[i].item())
+                rewards[cache_key] = reward
+                processed_count += 1
+
+        print(f"\n成功处理了 {processed_count} 个样本。")
+        with open(self.reward_cache_path, 'wb') as f:
+            pickle.dump(rewards, f)
+        print(f"奖励已生成并缓存到 {self.reward_cache_path}")
 
     def _load_historical_facts(self, file_path: str) -> List[tuple]:
         facts = []
@@ -178,7 +210,6 @@ class MultiAgentCoHPredictor:
         mapping = {}
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                # 假设第一行是标题，如果entity2id.txt和relation2id.txt有标题行
                 if 'entity' in file_path or 'relation' in file_path:
                     next(f, None)
                 for line in f:
@@ -207,9 +238,7 @@ class MultiAgentCoHPredictor:
     def _get_recent_history(self, entity_id: int, timestamp: int, limit: int = 10) -> List[tuple]:
         """获取一个实体的最近历史事件。"""
         related_facts = self.adj_list.get(entity_id, [])
-        # 筛选出在查询时间点之前的事件
         past_facts = [fact for fact in related_facts if fact[2] < timestamp]
-        # 按时间戳降序排序并取最近的N条记录
         past_facts.sort(key=lambda x: x[2], reverse=True)
         return past_facts[:limit]
 
@@ -220,7 +249,6 @@ class MultiAgentCoHPredictor:
 
         history_text = ""
         for r, t, ts in facts:
-            # 注意：这里的头实体是固定的，所以我们从主调函数获取
             r_text = self.id_to_relation.get(r, f"关系_{r}")
             t_text = self.id_to_entity.get(t, f"实体_{t}")
             date_text = self.id_to_ts.get(ts, f"时间_{ts}")

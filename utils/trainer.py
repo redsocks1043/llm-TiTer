@@ -5,13 +5,12 @@ import tqdm
 
 
 class Trainer(object):
-    def __init__(self, model, pg, optimizer, args, distribution=None):
+    def __init__(self, model, pg, optimizer, args, llm_rewards=None):
         self.model = model
         self.pg = pg
         self.optimizer = optimizer
         self.args = args
-        self.distribution = distribution
-        self.reward_cache = {}
+        self.llm_rewards = llm_rewards  # 新增：存储LLM奖励
         self.device = torch.device("cuda" if args.cuda else "cpu")
 
     def train_epoch(self, dataloader, ntriple):
@@ -33,39 +32,24 @@ class Trainer(object):
                 all_loss, all_logits, _, current_entities, current_time = self.model(src_batch, time_batch, rel_batch,
                                                                                      dst_batch)
 
-                reward = self.pg.get_reward(current_entities, dst_batch)
+                # 默认的RL环境奖励
+                env_reward = self.pg.get_reward(current_entities, dst_batch)
+
+                # 新增：结合LLM奖励
+                final_reward = env_reward.clone()  # 先复制环境奖励
+                if self.llm_rewards:
+                    for i in range(len(src_batch)):
+                        key = (src_batch[i].item(), rel_batch[i].item(), time_batch[i].item())
+                        if key in self.llm_rewards:
+                            # 结合奖励，例如：用LLM奖励覆盖，或者加权平均
+                            # 这里我们简单地将LLM奖励加到原始奖励上
+                            final_reward[i] += self.llm_rewards[key]
 
                 success_rate, _ = self.model.calculate_success_rate(current_entities, dst_batch)
                 total_success_rate += success_rate
 
-                # 简化奖励整形逻辑，处理distribution为None的情况
-                if self.args.reward_shaping and self.distribution is not None:
-                    delta_time = time_batch - current_time
-                    p_dt = []
-                    for i in range(rel_batch.shape[0]):
-                        rel = rel_batch[i].item()
-                        dt = delta_time[i].item() // self.args.time_span
-                        cache_key = (rel, dt)
-
-                        if cache_key in self.reward_cache:
-                            p_dt.append(self.reward_cache[cache_key])
-                        else:
-                            try:
-                                reward_val = self.distribution[rel, dt]
-                                self.reward_cache[cache_key] = reward_val
-                                p_dt.append(reward_val)
-                            except (IndexError, TypeError):
-                                # 处理索引错误或distribution为None的情况
-                                reward_val = 0.0
-                                self.reward_cache[cache_key] = reward_val
-                                p_dt.append(reward_val)
-
-                    p_dt = torch.tensor(p_dt, device=self.device)
-                    beta = getattr(self.args, "reward_shaping_beta", 1.0)
-                    shaped_reward = reward + beta * p_dt
-                    cum_discounted_reward = self.pg.calc_cum_discounted_reward(shaped_reward)
-                else:
-                    cum_discounted_reward = self.pg.calc_cum_discounted_reward(reward)
+                # 使用最终的组合奖励
+                cum_discounted_reward = self.pg.calc_cum_discounted_reward(final_reward)
 
                 reinfore_loss = self.pg.calc_reinforce_loss(all_loss, all_logits, cum_discounted_reward)
                 self.pg.baseline.update(torch.mean(cum_discounted_reward))
@@ -78,10 +62,10 @@ class Trainer(object):
                 self.optimizer.step()
 
                 total_loss += reinfore_loss
-                total_reward += torch.mean(reward)
+                total_reward += torch.mean(final_reward)  # 使用final_reward
                 counter += 1
                 bar.update(self.args.batch_size)
-                bar.set_postfix(loss='%.4f' % reinfore_loss, reward='%.4f' % torch.mean(reward).item(),
+                bar.set_postfix(loss='%.4f' % reinfore_loss, reward='%.4f' % torch.mean(final_reward).item(),
                                 success='%.4f' % success_rate)
 
         avg_success_rate = total_success_rate / counter

@@ -144,18 +144,26 @@ class Env(object):
             else:
                 action_array = self.get_state_actions_space_complete(entites[i], times[i], True)
 
-            if action_array.shape[0] == 0:
-                continue
+            # ----- 修改NO_OP逻辑 -----
+            start_idx = 0
+            has_real_actions = action_array.shape[0] > 0
 
-            # Whether to keep the action NO_OPERATION
-            start_idx = 1
-            if first_step:
-                # The first step cannot stay in place
-                start_idx = 0
+            # 如果不是第一步，并且有其他真实动作，则将NO_OP放在动作列表的第一个位置
+            if not first_step and has_real_actions:
+                actions[i, 0, 0] = self.NO_OP
+                actions[i, 0, 1] = entites[i]
+                actions[i, 0, 2] = times[i]
+                start_idx = 1
+            # 如果是第一步，或者没有任何其他动作，则不强制添加NO_OP（或NO_OP是唯一选择）
+            elif not has_real_actions:
+                actions[i, 0, 0] = self.NO_OP
+                actions[i, 0, 1] = entites[i]
+                actions[i, 0, 2] = times[i]
+                continue  # 没有其他动作，直接进入下一次循环
 
-            if action_array.shape[0] > (max_action_num - start_idx):
-                # Sample. Take the latest events.
-                actions[i, start_idx:, ] = action_array[:max_action_num-start_idx]
-            else:
-                actions[i, start_idx:action_array.shape[0]+start_idx, ] = action_array
+            # 填充真实的动作
+            if has_real_actions:
+                num_actions_to_fill = min(action_array.shape[0], max_action_num - start_idx)
+                actions[i, start_idx: start_idx + num_actions_to_fill, ] = action_array[:num_actions_to_fill]
+
         return actions

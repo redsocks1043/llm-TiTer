@@ -66,7 +66,7 @@ def parse_args(args=None):
     # Policy Gradient Params
     parser.add_argument('--Lambda', default=0.99, type=float, help='update rate of baseline.')
     parser.add_argument('--Gamma', default=0.95, type=float, help='discount factor of Bellman Eq.')
-    parser.add_argument('--Ita', default=0.01, type=float, help='regular proportionality constant.')
+    parser.add_argument('--Ita', default=0.1, type=float, help='regular proportionality constant.')
     parser.add_argument('--Zita', default=0.9, type=float, help='attenuation factor of entropy regular term.')
 
     # reward shaping params
@@ -142,6 +142,28 @@ def main(args):
         num_workers=args.num_workers,
     )
 
+    ###################### 新增：奖励生成 ###########################
+    rewards_path = os.path.join(args.data_path, 'rewards.pkl')
+    llm_rewards = None
+    if os.path.exists(rewards_path):
+        logging.info(f"正在从 {rewards_path} 加载已缓存的奖励...")
+        with open(rewards_path, 'rb') as f:
+            llm_rewards = pickle.load(f)
+        logging.info("成功加载缓存的奖励。")
+    else:
+        logging.warning(f"在 {rewards_path} 未找到奖励缓存文件。")
+        logging.info("现在开始使用LLM生成奖励，这个过程只需要执行一次...")
+
+        # 初始化LLM预测器并生成奖励
+        llm_predictor = MultiAgentCoHPredictor(dataset_path=args.data_path)
+        llm_predictor.generate_and_cache_rewards(train_dataloader)
+
+        logging.info(f"奖励生成完毕，并已保存到 {rewards_path}。")
+        logging.info("正在重新加载刚生成的奖励文件...")
+        with open(rewards_path, 'rb') as f:
+            llm_rewards = pickle.load(f)
+        logging.info("成功加载奖励。")
+
     ######################Creat the agent and the environment###########################
     config = get_model_config(args, baseData.num_e, baseData.num_r)
     logging.info(config)
@@ -194,9 +216,9 @@ def main(args):
         logging.info('Load pretrain model: {}'.format(args.load_model_path))
 
     ######################Training and Testing###########################
-    distributions = None
-    trainer = Trainer(episode, pg, optimizer, args, distributions)
-    tester = Tester(episode, args, baseData.train_entities, baseData.RelEntCooccurrence, distributions)
+    # distributions = None
+    trainer = Trainer(episode, pg, optimizer, args,llm_rewards=llm_rewards)
+    tester = Tester(episode, args, baseData.train_entities, baseData.RelEntCooccurrence)
 
 
     if args.do_train:
