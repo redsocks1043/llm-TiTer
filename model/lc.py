@@ -1,256 +1,411 @@
-import os
-import json
-import requests
-from collections import defaultdict
-from typing import List
+import numpy as np
 import pickle
-from tqdm import tqdm
-import re  # <-- THIS IS THE FIX
+import json
+from typing import Dict, List, Tuple, Any
+import logging
+from collections import defaultdict
 
-class MultiAgentCoHPredictor:
-    """
-    一个简化的、受GenTKG启发的预测器。
-    它利用一个大型语言模型（LLM），根据强化学习（RL）模型提供的高质量候选实体，
-    结合历史上下文，来预测时序知识图谱中的尾实体。
-    """
 
-    def __init__(self, dataset_path: str,
-                 execution_model: str = 'llama2:7b',
-                 ollama_base_url: str = 'http://localhost:11434',
-                 temperature: float = 0.7,
-                 device: str = "cuda:0"):
-        """
-        初始化预测器。
-        """
-        if not dataset_path:
-            raise ValueError("必须提供数据集路径 (dataset_path)。")
+class LLMPriorRewardGenerator:
+    """使用大模型生成先验奖励的类"""
 
-        dataset_path = os.path.abspath(os.path.expanduser(dataset_path))
+    def __init__(self, data_path: str, config: Dict[str, Any]):
+        self.data_path = data_path
+        self.config = config
+        self.entity2id = {}
+        self.relation2id = {}
+        self.id2entity = {}
+        self.id2relation = {}
+        self.time2id = {}
+        self.id2time = {}
 
-        self.execution_model = execution_model
-        self.ollama_api_url = f"{ollama_base_url}/api/generate"
-        self.temperature = temperature
-        self.device = device
-        self.reward_cache_path = os.path.join(dataset_path, 'rewards.pkl')
+        # 先验知识存储
+        self.entity_types = {}  # 实体类型信息
+        self.relation_semantics = {}  # 关系语义信息
+        self.temporal_patterns = {}  # 时间模式
 
-        # 加载数据映射
-        self.entity_map = self._load_map(os.path.join(dataset_path, 'entity2id.txt'))
-        self.relation_map = self._load_map(os.path.join(dataset_path, 'relation2id.txt'))
-        self.ts_map = self._load_ts_map(dataset_path)
+        # 奖励缓存
+        self.reward_cache = {}
 
-        # 创建反向映射以便于查找
-        self.id_to_entity = {v: k for k, v in self.entity_map.items()}
-        self.id_to_relation = {v: k for k, v in self.relation_map.items()}
-        self.id_to_ts = {int(v): k for k, v in self.ts_map.items()}
+        self.logger = logging.getLogger(__name__)
+        self._load_data()
+        self._initialize_prior_knowledge()
 
-        # 加载历史事实用于上下文构建
-        self.historical_facts = self._load_historical_facts(os.path.join(dataset_path, 'train.txt'))
-        self.adj_list = self._build_adj_list(self.historical_facts)
-
-        print("LLM 预测器初始化完成。")
-        print(f"执行模型: {self.execution_model}")
-        print(f"从 {dataset_path} 加载了 {len(self.historical_facts)} 条历史事实。")
-
-    def _call_ollama_model(self, model_name: str, prompt: str) -> str:
-        """
-        调用指定的Ollama模型。
-        """
-        payload = {
-            "model": model_name,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": self.temperature}
-        }
+    def _load_data(self):
+        """加载数据文件"""
         try:
-            # I've also re-added the timeout for robustness
-            response = requests.post(self.ollama_api_url, json=payload, timeout=180)
-            response.raise_for_status()
-            return response.json().get('response', '')
-        except requests.RequestException as e:
-            print(f"调用Ollama模型 {model_name} 时出错: {e}")
-            return ""
-
-    def predict_tail_entities_with_multi_agents(self, head_id: int, relation_id: int, timestamp: int,
-                                                rl_candidate_entities: List[str], top_k: int = 10) -> List[tuple]:
-        """
-        使用LLM根据RL提供的候选实体列表进行最终预测。
-        """
-        head_text = self.id_to_entity.get(head_id, f"实体_{head_id}")
-        relation_text = self.id_to_relation.get(relation_id, f"关系_{relation_id}")
-        date_text = self.id_to_ts.get(timestamp, f"时间_{timestamp}")
-
-        available_entities_for_prompt = "\n".join([f"- {name}" for name in rl_candidate_entities])
-        history_facts = self._get_recent_history(head_id, timestamp)
-        history_text = self._convert_facts_to_text(history_facts)
-        objective = f"在{date_text}，当发生事件“{head_text} {relation_text} ?”时，最有可能的尾实体是什么？"
-
-        final_prediction_prompt = f"""You are an expert in temporal knowledge graph reasoning. Your task is to predict the most likely tail entity based on the provided context and a list of high-quality candidates.
-
-### Objective:
-{objective}
-
-### Historical Context (Recent events involving "{head_text}"):
-{history_text}
-
-### High-Quality Candidate Entities (Your final answer MUST be strictly selected from this list):
-{available_entities_for_prompt}
-
-### Instructions:
-1. Analyze the "Historical Context" and the "Objective" to understand logical and temporal patterns.
-2. Your answer MUST be one of the entities from the "High-Quality Candidate Entities" list.
-3. List the top {top_k} most likely entities, ordered from most likely to least likely.
-4. Provide ONLY the ordered list of entity names. Do not include any explanations or reasoning.
-
-### Final Prediction:
-"""
-        final_result = self._call_ollama_model(self.execution_model, final_prediction_prompt)
-        return self._parse_final_predictions(final_result, top_k, rl_candidate_entities)
-
-    def _parse_final_predictions(self, response_text: str, top_k: int, available_entities: List[str]) -> List[tuple]:
-        """
-        解析LLM的输出，提取排序后的实体列表。
-        """
-        predictions = []
-        lines = [line.strip() for line in response_text.strip().split('\n')]
-
-        for line in lines:
-            if not line: continue
-            entity_text = line.split('.', 1)[-1].strip().replace('*', '').replace('-', '').strip()
-            matched_entity = next((cand for cand in available_entities if cand.lower() == entity_text.lower()), None)
-            if matched_entity:
-                if matched_entity not in [p[1] for p in predictions]:
-                    predictions.append(("llm_prediction", matched_entity))
-            if len(predictions) >= top_k:
-                break
-
-        if len(predictions) < top_k:
-            for cand in available_entities:
-                if cand not in [p[1] for p in predictions]:
-                    predictions.append(("rl_candidate_fallback", cand))
-                if len(predictions) >= top_k:
-                    break
-        return predictions
-
-    def generate_and_cache_rewards(self, dataloader):
-        """
-        【优化版】使用LLM从训练数据生成奖励并缓存到文件。
-        该版本采用批处理方式，将一个批次的数据合并为单个Prompt进行请求。
-        """
-        rewards = {}
-        processed_count = 0
-
-        for batch in tqdm(dataloader, desc="Generating LLM Rewards (Batch Mode)"):
-            src_batch, rel_batch, dst_batch, time_batch = batch
-            batch_prompt_parts = []
-
-            for i in range(len(src_batch)):
-                head_id = src_batch[i].item()
-                relation_id = rel_batch[i].item()
-                timestamp = time_batch[i].item()
-
-                head_text = self.id_to_entity.get(head_id, f"实体_{head_id}")
-                relation_text = self.id_to_relation.get(relation_id, f"关系_{relation_id}")
-                date_text = self.id_to_ts.get(timestamp, f"时间_{timestamp}")
-
-                history_facts = self._get_recent_history(head_id, timestamp)
-                history_text = self._convert_facts_to_text(history_facts)
-                objective = f"在{date_text}，当发生事件“{head_text} {relation_text} ?”时，最有可能的尾实体是什么？"
-
-                prompt_part = f"""--- Sample {i} ---
-### Objective:
-{objective}
-
-### Historical Context:
-{history_text}
-"""
-                batch_prompt_parts.append(prompt_part)
-
-            final_batch_prompt = "You will be given multiple samples, each with an objective and historical context. For each sample, predict the single most likely tail entity.\nYour response must follow this format exactly, with one line for each sample:\nAnswer for Sample 0: [Entity Name]\nAnswer for Sample 1: [Entity Name]\n...\n\n" + "\n".join(
-                batch_prompt_parts)
-
-            llm_batch_response = self._call_ollama_model(self.execution_model, final_batch_prompt)
-
-            if not llm_batch_response:
-                print(f"  - Skipped batch due to LLM call failure.")
-                continue
-
-            predictions = re.findall(r"Answer for Sample (\d+):\s*(.*)", llm_batch_response)
-            parsed_predictions = {int(index): answer.strip() for index, answer in predictions}
-
-            for i in range(len(src_batch)):
-                llm_prediction = parsed_predictions.get(i)
-                if llm_prediction is None:
-                    continue
-
-                true_tail_id = dst_batch[i].item()
-                true_tail_text = self.id_to_entity.get(true_tail_id, f"实体_{true_tail_id}")
-                reward = 1.0 if true_tail_text.lower() in llm_prediction.lower() else -1.0
-                cache_key = (src_batch[i].item(), rel_batch[i].item(), time_batch[i].item())
-                rewards[cache_key] = reward
-                processed_count += 1
-
-        print(f"\n成功处理了 {processed_count} 个样本。")
-        with open(self.reward_cache_path, 'wb') as f:
-            pickle.dump(rewards, f)
-        print(f"奖励已生成并缓存到 {self.reward_cache_path}")
-
-    def _load_historical_facts(self, file_path: str) -> List[tuple]:
-        facts = []
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
+            # 加载实体、关系、时间映射
+            with open(f"{self.data_path}/entity2id.txt", 'r', encoding='utf-8') as f:
                 for line in f:
-                    parts = line.strip().split()
-                    if len(parts) == 4:
-                        facts.append(tuple(map(int, parts)))
-        except FileNotFoundError:
-            print(f"警告: 历史事实文件 {file_path} 未找到。")
-        return facts
+                    entity, id_str = line.strip().split('\t')
+                    ent_id = int(id_str)
+                    self.entity2id[entity] = ent_id
+                    self.id2entity[ent_id] = entity
 
-    def _load_map(self, file_path: str) -> dict:
-        mapping = {}
+            with open(f"{self.data_path}/relation2id.txt", 'r', encoding='utf-8') as f:
+                for line in f:
+                    relation, id_str = line.strip().split('\t')
+                    rel_id = int(id_str)
+                    self.relation2id[relation] = rel_id
+                    self.id2relation[rel_id] = relation
+
+            # 如果有时间信息
+            if hasattr(self.config, 'time_span'):
+                for i in range(self.config.time_span):
+                    self.time2id[i] = i
+                    self.id2time[i] = i
+
+            self.logger.info(f"加载了 {len(self.entity2id)} 个实体, {len(self.relation2id)} 个关系")
+
+        except Exception as e:
+            self.logger.error(f"数据加载失败: {e}")
+            raise
+
+    def _initialize_prior_knowledge(self):
+        """初始化先验知识"""
+        # 1. 分析关系的语义类型
+        self._analyze_relation_semantics()
+
+        # 2. 分析实体类型（基于关系和上下文）
+        self._analyze_entity_types()
+
+        # 3. 分析时间模式
+        self._analyze_temporal_patterns()
+
+    def _analyze_relation_semantics(self):
+        """分析关系的语义特征"""
+        # 定义一些常见的关系语义类型
+        semantic_patterns = {
+            'location': ['located_in', 'capital_of', 'part_of', 'neighbor_of'],
+            'social': ['friend_of', 'family_of', 'colleague_of', 'enemy_of'],
+            'political': ['leader_of', 'member_of', 'ally_of', 'oppose'],
+            'economic': ['trade_with', 'invest_in', 'own', 'work_for'],
+            'temporal': ['before', 'after', 'during', 'simultaneous'],
+            'causal': ['cause', 'result_in', 'influence', 'affect']
+        }
+
+        for rel_id, relation in self.id2relation.items():
+            relation_lower = relation.lower().replace('_', ' ')
+
+            # 基于关系名称推断语义类型
+            semantic_type = 'general'  # 默认类型
+            for sem_type, patterns in semantic_patterns.items():
+                if any(pattern in relation_lower for pattern in patterns):
+                    semantic_type = sem_type
+                    break
+
+            self.relation_semantics[rel_id] = {
+                'type': semantic_type,
+                'name': relation,
+                'transitivity_score': self._estimate_transitivity(relation),
+                'temporal_sensitivity': self._estimate_temporal_sensitivity(relation)
+            }
+
+    def _estimate_transitivity(self, relation: str) -> float:
+        """估计关系的传递性强度"""
+        transitive_keywords = ['part_of', 'located_in', 'member_of', 'subset_of']
+        if any(keyword in relation.lower() for keyword in transitive_keywords):
+            return 0.8
+        return 0.3
+
+    def _estimate_temporal_sensitivity(self, relation: str) -> float:
+        """估计关系对时间的敏感性"""
+        temporal_keywords = ['during', 'before', 'after', 'when', 'while']
+        if any(keyword in relation.lower() for keyword in temporal_keywords):
+            return 0.9
+        return 0.4
+
+    def _analyze_entity_types(self):
+        """分析实体类型（基于关系使用模式）"""
+        # 这里可以通过训练数据中的三元组来推断实体类型
+        entity_relation_freq = defaultdict(lambda: defaultdict(int))
+
+        # 读取训练数据来分析实体-关系共现模式
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                if 'entity' in file_path or 'relation' in file_path:
-                    next(f, None)
+            with open(f"{self.data_path}/train.txt", 'r', encoding='utf-8') as f:
                 for line in f:
                     parts = line.strip().split('\t')
-                    if len(parts) == 2:
-                        mapping[parts[0]] = int(parts[1])
-        except FileNotFoundError:
-            print(f"警告: 映射文件 {file_path} 未找到。")
-        return mapping
+                    if len(parts) >= 3:
+                        head = int(parts[0])
+                        rel = int(parts[1])
+                        entity_relation_freq[head][rel] += 1
+        except:
+            pass
 
-    def _load_ts_map(self, dataset_path: str) -> dict:
-        ts_path = os.path.join(dataset_path, 'ts2id.json')
+        # 基于关系使用模式推断实体类型
+        for ent_id in self.id2entity:
+            if ent_id in entity_relation_freq:
+                # 找到最常用的关系类型
+                most_common_rel_types = defaultdict(int)
+                for rel_id, freq in entity_relation_freq[ent_id].items():
+                    if rel_id in self.relation_semantics:
+                        rel_type = self.relation_semantics[rel_id]['type']
+                        most_common_rel_types[rel_type] += freq
+
+                if most_common_rel_types:
+                    primary_type = max(most_common_rel_types.items(), key=lambda x: x[1])[0]
+                    self.entity_types[ent_id] = {
+                        'primary_type': primary_type,
+                        'relation_profile': dict(most_common_rel_types)
+                    }
+
+    def _analyze_temporal_patterns(self):
+        """分析时间模式"""
+        # 这里可以分析不同关系在不同时间的活跃程度
+        self.temporal_patterns = {
+            'relation_time_activity': defaultdict(lambda: defaultdict(float)),
+            'global_time_activity': defaultdict(float)
+        }
+
+    def compute_path_reward(self, path: List[Tuple[int, int, int]],
+                            target_entity: int, current_time: int = None) -> float:
+        """计算路径的先验奖励"""
+        if not path:
+            return 0.0
+
+        # 缓存键
+        cache_key = (tuple(path), target_entity, current_time)
+        if cache_key in self.reward_cache:
+            return self.reward_cache[cache_key]
+
+        total_reward = 0.0
+        path_length = len(path)
+
+        # 1. 路径语义一致性奖励
+        semantic_consistency = self._compute_semantic_consistency(path)
+        total_reward += semantic_consistency * 0.3
+
+        # 2. 路径长度惩罚（避免过长路径）
+        length_penalty = max(0, 1.0 - (path_length - 2) * 0.2)
+        total_reward += length_penalty * 0.2
+
+        # 3. 目标导向性奖励
+        target_orientation = self._compute_target_orientation(path, target_entity)
+        total_reward += target_orientation * 0.4
+
+        # 4. 时间一致性奖励
+        if current_time is not None:
+            temporal_consistency = self._compute_temporal_consistency(path, current_time)
+            total_reward += temporal_consistency * 0.1
+
+        # 归一化到 [0, 1] 区间
+        total_reward = max(0.0, min(1.0, total_reward))
+
+        # 缓存结果
+        self.reward_cache[cache_key] = total_reward
+
+        return total_reward
+
+    def _compute_semantic_consistency(self, path: List[Tuple[int, int, int]]) -> float:
+        """计算路径的语义一致性"""
+        if len(path) < 2:
+            return 1.0
+
+        consistency_score = 0.0
+        relation_types = []
+
+        for _, rel_id, _ in path:
+            if rel_id in self.relation_semantics:
+                rel_type = self.relation_semantics[rel_id]['type']
+                relation_types.append(rel_type)
+
+        if not relation_types:
+            return 0.5
+
+        # 计算语义类型的一致性
+        type_counts = defaultdict(int)
+        for rel_type in relation_types:
+            type_counts[rel_type] += 1
+
+        # 如果主要使用同一语义类型的关系，给予较高奖励
+        max_type_count = max(type_counts.values())
+        consistency_score = max_type_count / len(relation_types)
+
+        return consistency_score
+
+    def _compute_target_orientation(self, path: List[Tuple[int, int, int]],
+                                    target_entity: int) -> float:
+        """计算路径的目标导向性"""
+        if not path:
+            return 0.0
+
+        # 检查路径是否朝着目标实体的方向发展
+        current_entity = path[0][0]  # 起始实体
+        final_entity = path[-1][2]  # 最终实体
+
+        # 如果直接到达目标，给最高奖励
+        if final_entity == target_entity:
+            return 1.0
+
+        # 基于实体类型相似性计算方向性
+        target_orientation_score = 0.0
+
+        if target_entity in self.entity_types and final_entity in self.entity_types:
+            target_type = self.entity_types[target_entity].get('primary_type', 'general')
+            final_type = self.entity_types[final_entity].get('primary_type', 'general')
+
+            if target_type == final_type:
+                target_orientation_score += 0.7
+            else:
+                target_orientation_score += 0.3
+        else:
+            target_orientation_score = 0.4  # 默认中等分数
+
+        # 考虑路径中关系的传递性
+        transitivity_bonus = 0.0
+        for _, rel_id, _ in path:
+            if rel_id in self.relation_semantics:
+                transitivity_score = self.relation_semantics[rel_id]['transitivity_score']
+                transitivity_bonus += transitivity_score
+
+        if path:
+            transitivity_bonus /= len(path)
+
+        target_orientation_score = (target_orientation_score + transitivity_bonus * 0.3) / 1.3
+
+        return min(1.0, target_orientation_score)
+
+    def _compute_temporal_consistency(self, path: List[Tuple[int, int, int]],
+                                      current_time: int) -> float:
+        """计算时间一致性"""
+        if not path:
+            return 1.0
+
+        temporal_score = 0.0
+
+        for _, rel_id, _ in path:
+            if rel_id in self.relation_semantics:
+                temporal_sensitivity = self.relation_semantics[rel_id]['temporal_sensitivity']
+                # 根据关系的时间敏感性调整分数
+                temporal_score += temporal_sensitivity
+
+        if path:
+            temporal_score /= len(path)
+
+        return temporal_score
+
+    def compute_action_reward(self, current_entity: int, action_relation: int,
+                              next_entity: int, target_entity: int,
+                              current_path_length: int = 0) -> float:
+        """计算单步动作的先验奖励"""
+        # 避免NO_OP操作获得高奖励
+        if action_relation == 0 or next_entity == current_entity:
+            # 如果路径长度已经很长，NO_OP可能是合理的
+            if current_path_length >= self.config.get('path_length', 3):
+                return 0.1
+            else:
+                return -0.2  # 惩罚早期的NO_OP
+
+        # 如果直接到达目标
+        if next_entity == target_entity:
+            return 1.0
+
+        reward = 0.0
+
+        # 1. 关系质量奖励
+        if action_relation in self.relation_semantics:
+            rel_info = self.relation_semantics[action_relation]
+            reward += 0.3  # 基础关系奖励
+
+            # 根据关系类型调整
+            if rel_info['type'] in ['location', 'social', 'political']:
+                reward += 0.1  # 这些关系通常更有意义
+
+        # 2. 实体类型匹配奖励
+        if (target_entity in self.entity_types and
+                next_entity in self.entity_types):
+
+            target_type = self.entity_types[target_entity].get('primary_type', 'general')
+            next_type = self.entity_types[next_entity].get('primary_type', 'general')
+
+            if target_type == next_type:
+                reward += 0.3
+            else:
+                reward += 0.1
+
+        # 3. 路径长度考虑
+        length_factor = max(0.1, 1.0 - current_path_length * 0.15)
+        reward *= length_factor
+
+        return min(1.0, max(-0.5, reward))
+
+    def update_reward_based_on_success(self, path: List[Tuple[int, int, int]],
+                                       success: bool, target_entity: int):
+        """基于成功与否更新奖励（在线学习）"""
+        cache_key = (tuple(path), target_entity, None)
+
+        if cache_key in self.reward_cache:
+            old_reward = self.reward_cache[cache_key]
+
+            if success:
+                # 成功的路径，增加奖励
+                new_reward = min(1.0, old_reward + 0.1)
+            else:
+                # 失败的路径，减少奖励
+                new_reward = max(0.0, old_reward - 0.05)
+
+            self.reward_cache[cache_key] = new_reward
+
+    def save_rewards(self, save_path: str):
+        """保存奖励缓存"""
+        reward_data = {
+            'reward_cache': dict(self.reward_cache),
+            'relation_semantics': self.relation_semantics,
+            'entity_types': self.entity_types,
+            'temporal_patterns': self.temporal_patterns
+        }
+
+        with open(save_path, 'wb') as f:
+            pickle.dump(reward_data, f)
+
+        self.logger.info(f"奖励数据保存到 {save_path}")
+
+    def load_rewards(self, load_path: str):
+        """加载奖励缓存"""
         try:
-            with open(ts_path, 'r') as f:
-                return json.load(f)
-        except FileNotFoundError:
-            print(f"警告: {ts_path} 未找到。时间戳映射将不可用。")
-            return {}
+            with open(load_path, 'rb') as f:
+                reward_data = pickle.load(f)
 
-    def _build_adj_list(self, facts: List[tuple]) -> defaultdict:
-        adj_list = defaultdict(list)
-        for h, r, t, ts in facts:
-            adj_list[h].append((r, t, ts))
-        return adj_list
+            self.reward_cache = reward_data.get('reward_cache', {})
+            self.relation_semantics.update(reward_data.get('relation_semantics', {}))
+            self.entity_types.update(reward_data.get('entity_types', {}))
+            self.temporal_patterns.update(reward_data.get('temporal_patterns', {}))
 
-    def _get_recent_history(self, entity_id: int, timestamp: int, limit: int = 10) -> List[tuple]:
-        """获取一个实体的最近历史事件。"""
-        related_facts = self.adj_list.get(entity_id, [])
-        past_facts = [fact for fact in related_facts if fact[2] < timestamp]
-        past_facts.sort(key=lambda x: x[2], reverse=True)
-        return past_facts[:limit]
+            self.logger.info(f"从 {load_path} 加载了 {len(self.reward_cache)} 个奖励缓存")
 
-    def _convert_facts_to_text(self, facts: List[tuple]) -> str:
-        """将事实元组转换为可读的文本格式。"""
-        if not facts:
-            return "No recent historical events found."
+        except Exception as e:
+            self.logger.warning(f"无法加载奖励缓存: {e}")
 
-        history_text = ""
-        for r, t, ts in facts:
-            r_text = self.id_to_relation.get(r, f"关系_{r}")
-            t_text = self.id_to_entity.get(t, f"实体_{t}")
-            date_text = self.id_to_ts.get(ts, f"时间_{ts}")
-            history_text += f"- On {date_text}, event involved {t_text} via relation {r_text}.\n"
-        return history_text
+
+# 使用示例
+def create_prior_rewards(config, data_path: str, save_path: str):
+    """创建并保存先验奖励"""
+    generator = LLMPriorRewardGenerator(data_path, config)
+
+    # 如果有现有的奖励文件，先加载
+    try:
+        generator.load_rewards(f"{data_path}/rewards.pkl")
+    except:
+        pass
+
+    # 保存更新后的奖励
+    generator.save_rewards(save_path)
+
+    return generator
+
+
+if __name__ == "__main__":
+    # 测试代码
+    class MockConfig:
+        def __init__(self):
+            self.path_length = 3
+            self.time_span = 24
+
+
+    config = MockConfig()
+    generator = create_prior_rewards(config, "data/ICEWS14", "data/ICEWS14/rewards.pkl")
+
+    # 测试奖励计算
+    test_path = [(1, 5, 10), (10, 12, 25)]
+    reward = generator.compute_path_reward(test_path, target_entity=25)
+    print(f"测试路径奖励: {reward}")
