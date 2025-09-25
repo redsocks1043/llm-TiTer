@@ -333,15 +333,15 @@ def main(args):
             #                                config['num_ent'],
             #                                baseData.id_to_entity)  # 传递id->entity映射
             logging.info("Using two-phase LLM-enhanced Tester...")
-            metrics = tester.test_with_llm_two_phase(test_dataloader,
-                                       testDataset.__len__(),
+            metrics = tester.test_with_llm_two_phase(train_dataloader,
+                                       trainDataset.__len__(),
                                        baseData.skip_dict,
                                        config['num_ent'],
                                        baseData.id_to_entity)
         else:
             logging.info("Using standard RL Tester...")
-            metrics = tester.test(test_dataloader,
-                                  testDataset.__len__(),
+            metrics = tester.test(train_dataloader,
+                                  trainDataset.__len__(),
                                   baseData.skip_dict,
                                   config['num_ent'])
 

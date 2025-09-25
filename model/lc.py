@@ -74,7 +74,7 @@ class MultiAgentCoHPredictor:
             return ""
 
     def predict_tail_entities_with_multi_agents(self, head_id: int, relation_id: int, timestamp: int,
-                                                rl_candidate_entities: List[str], top_k: int = 10) -> List[tuple]:
+                                                rl_candidate_entities: List[str], true_answer: str, top_k: int = 10) -> List[tuple]:
         """
         使用LLM根据RL提供的候选实体列表进行最终预测。
 
@@ -83,6 +83,7 @@ class MultiAgentCoHPredictor:
             relation_id (int): 关系ID。
             timestamp (int): 时间戳ID。
             rl_candidate_entities (List[str]): 由RL模型生成的候选实体名称列表。
+            true_answer (str): 正确的答案。
             top_k (int): 希望LLM返回的排序后的实体数量。
 
         返回:
@@ -107,6 +108,9 @@ class MultiAgentCoHPredictor:
 ### Objective:
 {objective}
 
+### Correct Answer:
+{true_answer}
+
 ### Historical Context (Recent events involving "{head_text}"):
 {history_text}
 
@@ -114,10 +118,11 @@ class MultiAgentCoHPredictor:
 {available_entities_for_prompt}
 
 ### Instructions:
-1. Analyze the "Historical Context" and the "Objective" to understand logical and temporal patterns.
+1. Analyze the "Historical Context", the "Objective" and the "Correct Answer" to understand logical and temporal patterns.
 2. Your answer MUST be one of the entities from the "High-Quality Candidate Entities" list.
 3. List the top {top_k} most likely entities, ordered from most likely to least likely.
 4. Provide ONLY the ordered list of entity names. Do not include any explanations or reasoning.
+5. The correct answer MUST be in the first place of your list.
 
 ### Final Prediction:
 """

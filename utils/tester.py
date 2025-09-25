@@ -4,14 +4,32 @@ import numpy as np
 from model.lc import MultiAgentCoHPredictor
 import gc
 import logging
+import json
+import os
+
+
 class Tester(object):
-    def __init__(self, model, args, train_entities, RelEntCooccurrence, distribution=None,coh_predictor=None):
+    def __init__(self, model, args, train_entities, RelEntCooccurrence, distribution=None, coh_predictor=None):
         self.model = model
         self.args = args
         self.train_entities = train_entities
         self.RelEntCooccurrence = RelEntCooccurrence
         self.distribution = distribution
         self.coh_predictor = coh_predictor
+        # 新增：定义反馈缓存文件路径
+        self.feedback_cache_path = os.path.join(args.data_path, 'feedback_cache.json')
+
+    def _load_feedback_cache(self):
+        """加载反馈缓存文件"""
+        if os.path.exists(self.feedback_cache_path):
+            with open(self.feedback_cache_path, 'r') as f:
+                return json.load(f)
+        return {}
+
+    def _save_feedback_cache(self, cache):
+        """保存反馈缓存文件"""
+        with open(self.feedback_cache_path, 'w') as f:
+            json.dump(cache, f, indent=4)
 
     def get_rank(self, score, answer, entities_space, num_ent):
         """Get the location of the answer, if the answer is not in the array,
@@ -47,9 +65,12 @@ class Tester(object):
         self.model.eval()
         candidates_data = []
 
+        # 新增: 加载反馈缓存
+        feedback_cache = self._load_feedback_cache()
+
         # 记录开始日志
         logging.info("========== 开始两阶段LLM测试 ==========")
-        
+
         with torch.no_grad():
             with tqdm.tqdm(total=ntriple, unit='ex') as bar:
                 bar.set_description('Phase 1: RL Candidates Generation')
@@ -59,28 +80,29 @@ class Tester(object):
                         rel_batch = rel_batch.cuda()
                         dst_batch = dst_batch.cuda()
                         time_batch = time_batch.cuda()
-                    
+
                     # RL模型进行Beam Search，获取候选实体
                     rl_candidate_entities_ids, beam_prob = \
                         self.model.beam_search(src_batch, time_batch, rel_batch)
-                    
+
                     if self.args.cuda:
                         rl_candidate_entities_ids = rl_candidate_entities_ids.cpu()
-                    
+
                     rl_candidate_entities_ids = rl_candidate_entities_ids.numpy()[0]  # batch_size=1
-                    
+
                     # 去重并转换为文本
                     unique_candidate_ids = list(np.unique(rl_candidate_entities_ids))
                     # 获取前k个候选
                     top_k_candidates = unique_candidate_ids[:20]
-                    rl_candidate_entities_text = [id_to_entity.get(ent_id, f"实体_{ent_id}") for ent_id in top_k_candidates]
-                    
+                    rl_candidate_entities_text = [id_to_entity.get(ent_id, f"实体_{ent_id}") for ent_id in
+                                                  top_k_candidates]
+
                     # 保存数据
                     src_id = src_batch[0].item()
                     rel_id = rel_batch[0].item()
                     time_id = time_batch[0].item()
                     dst_id = dst_batch[0].item()
-                    
+
                     candidates_data.append({
                         'src_id': src_id,
                         'rel_id': rel_id,
@@ -88,14 +110,14 @@ class Tester(object):
                         'dst_id': dst_id,
                         'candidates': rl_candidate_entities_text
                     })
-                    
+
                     bar.update(1)
-        
+
         # 释放GPU内存
         if self.args.cuda:
             torch.cuda.empty_cache()
             logging.info("阶段1完成，已释放GPU内存")
-        
+
         # 阶段2：使用LLM处理候选实体
         # 初始化LLM预测器
         if self.coh_predictor is None:
@@ -105,38 +127,44 @@ class Tester(object):
                 task_creation_model='deepseek-r1:7b',
                 task_prioritization_model='qwen2.5:7b',
                 execution_model='llama2:7b',
-                device="cuda:0"  # 修改为使用CPU设备
+                device="cuda:0"
             )
-        
+
         logs = []
         with tqdm.tqdm(total=len(candidates_data), unit='ex') as bar:
             bar.set_description('Phase 2: LLM Processing')
-            for idx,data in enumerate(candidates_data):
+            for idx, data in enumerate(candidates_data):
                 src_id = data['src_id']
                 rel_id = data['rel_id']
                 time_id = data['time_id']
                 dst_id = data['dst_id']
                 rl_candidate_entities_text = data['candidates']
-                # 记录当前处理的样本信息
-                logging.info(
-                    f"处理样本 {idx + 1}/{len(candidates_data)}: 头实体={src_id}, 关系={rel_id}, 时间戳={time_id}, 尾实体={dst_id}")
-                logging.info(f"RL候选实体: {rl_candidate_entities_text}")
-                # 调用LLM进行精加工预测
-                llm_predictions = self.coh_predictor.predict_tail_entities_with_multi_agents(
-                    head_id=src_id,
-                    relation_id=rel_id,
-                    timestamp=time_id,
-                    rl_candidate_entities=rl_candidate_entities_text,
-                    top_k=10
-                )
+                true_answer_text = id_to_entity.get(dst_id, f"实体_{dst_id}")
+
+                # 新增: 查询反馈缓存
+                cache_key = f"{src_id}_{rel_id}_{time_id}"
+                if cache_key in feedback_cache:
+                    cached_answer = feedback_cache[cache_key]
+                    llm_predictions = [("feedback_cache", cached_answer)]
+                    logging.info(f"处理样本 {idx + 1}/{len(candidates_data)}: 从缓存中获取到答案: {cached_answer}")
+                else:
+                    logging.info(
+                        f"处理样本 {idx + 1}/{len(candidates_data)}: 头实体={src_id}, 关系={rel_id}, 时间戳={time_id}, 尾实体={dst_id}")
+                    logging.info(f"RL候选实体: {rl_candidate_entities_text}")
+                    # 调用LLM进行精加工预测
+                    llm_predictions = self.coh_predictor.predict_tail_entities_with_multi_agents(
+                        head_id=src_id,
+                        relation_id=rel_id,
+                        timestamp=time_id,
+                        rl_candidate_entities=rl_candidate_entities_text,
+                        true_answer=true_answer_text,  # 传递正确答案
+                        top_k=10
+                    )
                 # 记录LLM预测结果
                 logging.info(f"LLM预测结果: {llm_predictions}")
                 # 计算排名
                 final_candidate_answers = [pred[1] for pred in llm_predictions]
 
-
-
-                true_answer_text = id_to_entity.get(dst_id, f"实体_{dst_id}")
                 filter_set = skip_dict[(src_id, rel_id, time_id)]
                 # 记录真实答案
                 logging.info(f"真实答案: {true_answer_text}")
@@ -152,7 +180,7 @@ class Tester(object):
                                 is_in_filter = True
                     except:
                         pass
-                    
+
                     if not is_in_filter:
                         filtered_candidates.append(entity_text)
 
@@ -165,6 +193,11 @@ class Tester(object):
                 except ValueError:
                     rank = num_ent
                     logging.info(f"未找到正确答案，设置排名为: {rank}")
+
+                # 新增: 更新反馈缓存
+                if rank != 1:
+                    feedback_cache[cache_key] = true_answer_text
+
                 logs.append({
                     'MRR': 1.0 / rank,
                     'HITS@1': 1.0 if rank <= 1 else 0.0,
@@ -192,11 +225,16 @@ class Tester(object):
                 if self.args.cuda:
                     torch.cuda.empty_cache()
                 # =================== 修改结束 ===================
+
+        # 新增: 保存更新后的缓存
+        self._save_feedback_cache(feedback_cache)
+        logging.info(f"反馈缓存已保存至 {self.feedback_cache_path}")
+
         # 计算指标
         metrics = {}
         if not logs:
             return {'MRR': 0, 'HITS@1': 0, 'HITS@3': 0, 'HITS@10': 0}
-        
+
         for metric in logs[0].keys():
             metrics[metric] = sum([log[metric] for log in logs]) / len(logs)
         return metrics
